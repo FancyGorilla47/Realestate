@@ -1,0 +1,13 @@
+# Azure App Service Requirements
+# Python 3.12 compatible
+
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+pytz
+twilio
+azure-core
+beautifulsoup4
+gunicorn
+azure-ai-voicelive

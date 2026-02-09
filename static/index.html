@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flight Voice Agent</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f0f2f5;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            color: #333;
+        }
+
+        .container {
+            text-align: center;
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
+            width: 90%;
+            max-width: 400px;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+            font-weight: 600;
+            color: #2c3e50;
+        }
+
+        .status {
+            margin-bottom: 30px;
+            font-size: 1.2em;
+            color: #7f8c8d;
+            height: 24px;
+        }
+
+        .mic-button {
+            width: 120px;
+            height: 120px;
+            border-radius: 50%;
+            border: none;
+            background-color: #3498db;
+            color: white;
+            font-size: 40px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 5px 15px rgba(52, 152, 219, 0.4);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            outline: none;
+        }
+
+        .mic-button:hover {
+            transform: scale(1.05);
+            background-color: #2980b9;
+        }
+
+        .mic-button.active {
+            background-color: #e74c3c;
+            animation: pulse 1.5s infinite;
+        }
+
+        .mic-button:disabled {
+            background-color: #bdc3c7;
+            cursor: not-allowed;
+            transform: none;
+            animation: none;
+        }
+
+        @keyframes pulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(231, 76, 60, 0.4);
+            }
+
+            70% {
+                box-shadow: 0 0 0 20px rgba(231, 76, 60, 0);
+            }
+
+            100% {
+                box-shadow: 0 0 0 0 rgba(231, 76, 60, 0);
+            }
+        }
+
+        .info {
+            margin-top: 20px;
+            font-size: 0.9em;
+            color: #95a5a6;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <h1>Flight Assistant</h1>
+        <div class="status" id="statusText">Ready to Connect</div>
+        <button class="mic-button" id="micBtn">
+            📞
+        </button>
+        <div class="info">Click to Start Conversation</div>
+    </div>
+
+    <script>
+        const micBtn = document.getElementById('micBtn');
+        const statusText = document.getElementById('statusText');
+
+        let ws;
+        let audioContext;
+        let processor;
+        let inputSource;
+        let isSessionActive = false;
+
+        // Audio Playback Queue State
+        let nextStartTime = 0;
+        let activeSources = [];
+
+        // Azure Live Voice expects 24kHz for best results with gpt-4o-realtime
+        const TARGET_SAMPLE_RATE = 24000;
+
+        // Initialize WebSocket
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            ws.onopen = () => {
+                console.log("Connected to WebSocket");
+                statusText.innerText = "Connected - Click to Talk";
+            };
+
+            ws.onmessage = async (event) => {
+                const data = JSON.parse(event.data);
+
+                if (data.type === 'audio') {
+                    // Play audio from server
+                    playRawPcmChunk(data.payload);
+                } else if (data.type === 'clear_audio') {
+                    console.log("Barge-in: Clear audio");
+                    clearAudioQueue();
+                }
+            };
+
+            ws.onclose = () => {
+                statusText.innerText = "Disconnected";
+                stopAudioCapture();
+                micBtn.disabled = true;
+                micBtn.classList.remove('active');
+            };
+        }
+
+        connect();
+
+        // Button Logic
+        micBtn.addEventListener('click', async () => {
+            if (!isSessionActive) {
+                await startAudioCapture();
+            } else {
+                stopAudioCapture();
+            }
+        });
+
+        // --- WEB AUDIO API CAPTURE ---
+        async function startAudioCapture() {
+            try {
+                // Ensure AudioContext is running (needed for browser autoplay policies)
+                if (!audioContext) {
+                    audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                        sampleRate: TARGET_SAMPLE_RATE
+                    });
+                }
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+
+                // Reset queue time
+                nextStartTime = audioContext.currentTime;
+
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        sampleRate: TARGET_SAMPLE_RATE
+                    }
+                });
+
+                inputSource = audioContext.createMediaStreamSource(stream);
+
+                // Buffer size 4096 is a good balance for browser performance vs latency
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                inputSource.connect(processor);
+                processor.connect(audioContext.destination);
+
+                processor.onaudioprocess = (e) => {
+                    if (ws.readyState === WebSocket.OPEN) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        // Convert Float32 to Int16 PCM
+                        const pcmData = floatTo16BitPCM(inputData);
+
+                        // Send as base64
+                        const base64Audio = arrayBufferToBase64(pcmData);
+                        ws.send(JSON.stringify({
+                            type: 'audio',
+                            payload: base64Audio
+                        }));
+                    }
+                };
+
+                isSessionActive = true;
+                ws.send(JSON.stringify({
+                    type: 'start'
+                }));
+                micBtn.classList.add('active');
+                micBtn.innerHTML = "🟥"; // Stop icon
+                statusText.innerText = "Listening (Open Mic)...";
+
+            } catch (err) {
+                console.error("Error accessing microphone:", err);
+                statusText.innerText = "Mic Error";
+            }
+        }
+
+        function stopAudioCapture() {
+            if (processor) {
+                processor.disconnect();
+                processor.onaudioprocess = null;
+            }
+            if (inputSource) {
+                inputSource.disconnect();
+            }
+            // Do NOT close audioContext here, or we can't play response audio!
+            // Just stop the capture graph.
+
+            isSessionActive = false;
+            micBtn.classList.remove('active');
+            micBtn.innerHTML = "📞";
+            statusText.innerText = "Ready";
+        }
+
+        // --- UTILS ---
+
+        function floatTo16BitPCM(input) {
+            const output = new Int16Array(input.length);
+            for (let i = 0; i < input.length; i++) {
+                const s = Math.max(-1, Math.min(1, input[i]));
+                output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return output.buffer;
+        }
+
+        function arrayBufferToBase64(buffer) {
+            let binary = '';
+            const bytes = new Uint8Array(buffer);
+            const len = bytes.byteLength;
+            for (let i = 0; i < len; i++) {
+                binary += String.fromCharCode(bytes[i]);
+            }
+            return window.btoa(binary);
+        }
+
+        function playRawPcmChunk(base64Data) {
+            if (!audioContext) {
+                // Initialize on playback if not yet ready (though usually init on click)
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: TARGET_SAMPLE_RATE
+                });
+            }
+
+            const binaryString = window.atob(base64Data);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) {
+                bytes[i] = binaryString.charCodeAt(i);
+            }
+            const int16Data = new Int16Array(bytes.buffer);
+            const floatData = new Float32Array(int16Data.length);
+
+            for (let i = 0; i < int16Data.length; i++) {
+                floatData[i] = int16Data[i] / 32768.0;
+            }
+
+            const buffer = audioContext.createBuffer(1, floatData.length, TARGET_SAMPLE_RATE);
+            buffer.getChannelData(0).set(floatData);
+
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+            source.connect(audioContext.destination);
+
+            // SCHEDULE PLAYBACK
+            // If nextStartTime is in the past, reset it to now + 100ms safety buffer
+            if (nextStartTime < audioContext.currentTime) {
+                nextStartTime = audioContext.currentTime + 0.1;
+            }
+
+            source.start(nextStartTime);
+
+            // Update nextStartTime for the NEXT chunk
+            // buffer.duration is in seconds
+            nextStartTime += buffer.duration;
+
+            // Track source for barge-in cancellation
+            activeSources.push(source);
+            source.onended = () => {
+                activeSources = activeSources.filter(s => s !== source);
+            }
+        }
+
+        function clearAudioQueue() {
+            // Stop all currently scheduled sources
+            activeSources.forEach(source => {
+                try {
+                    source.stop();
+                } catch (e) { }
+            });
+            activeSources = [];
+
+            // Reset schedule time so next speech starts immediately
+            if (audioContext) {
+                nextStartTime = audioContext.currentTime;
+            }
+        }
+
+    </script>
+
+</body>
+
+</html>
